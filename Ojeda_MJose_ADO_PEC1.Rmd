@@ -1,0 +1,539 @@
+---
+title: "PAC 1 - ANÁLISIS DE DATOS ÓMICOS (UOC)"
+subtitle: "Proceso de análisis de microarrays"
+author: "María José Ojeda-Montes"
+date: '`r format(Sys.Date(),"%e de %B, %Y")`'
+bibliography: biblio.bib
+csl: elsevier-vancouver.csl
+link-citations: yes
+output:
+  rmdformats::readthedown:
+    highlight: "pygments"
+    gallery: true
+    fig_width: 10
+    fig_height: 8
+    fig_caption: yes
+    use_bookdown: true
+    toc_depth: 3
+  prettydoc::html_pretty:
+    highlight: null
+    number_sections: false
+    theme: hpstr
+    toc: yes
+    toc_depth: 3
+    fig_caption: yes
+  pdf_document: 
+    fig_caption: yes
+    toc: true
+    toc_depth: 3
+  html_document:
+    fig_caption: yes
+    toc: true
+    number_sections: False
+    toc_float:
+      collapsed: true
+params:
+  sizeImage: [64,64]
+  target_file: targets.csv
+  normalized_file: normalized.Data.Rda
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+# Load packages
+library(knitr)
+library(oligo)
+library(Biobase)
+library(arrayQualityMetrics)
+library(ggplot2)
+library(ggrepel)
+library(affyio)
+library(pvca)
+library(genefilter)
+library(limma)
+library(gplots)
+```
+
+## ANÁLISIS DE MICROARRAYS
+
+```{r directories, include=FALSE}
+workDir <- getwd()
+setwd(workDir)
+dir.create("data")
+dir.create("results")
+dir.create("figures")
+dataDir <- file.path(workDir, "data")
+resultsDir <- file.path(workDir, "results")
+figuresDir <- file.path(workDir, "figures")
+```
+
+### Estudio de microarrays
+
++ _Título del estudio_: **Identification of a nutrient-sensing transcriptional network in monocytes by using inbred rat models on a cafeteria diet (2016)** [@PMID-27483348]
+
++ _Autores_: Neus Martínez-Micaelo, Noemí González-Abuín, Ximena Terra, Ana Ardévol, Monterrat Pinent, Enrico Petretto, Jacques Behmoaras y Mayte Blay
+
++ _Enlace al artículo_: [PMID-27483348](https://www.ncbi.nlm.nih.gov/pubmed/?term=27483348)
+
++ _Enlace a los datos_: [Repositorio GSE85167](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE85167)
+
++ _Enlace a github_: [](https://github.com/alexsanchezpla/StatisticalAnalysisOfMicroarrayData)
+
+El objetivo de la práctica es reproducir los resultados obtenidos por el propio artículo [@PMID-27483348] siguiendo el protocolo ofrecido en el material de la asignatura de Análisis de Datos Ómicos [@microarrays], entendiendo el por qué de cada uno de los pasos que se realizan.
+
+Por lo tanto, el objetivo principal de este estudio es **analizar el efecto de la dieta (STD vs cafetería) en la expresión genética de cada tipo de rata (lewis o wistar kyoto).** También se pretende **analizar si la dieta afecta de forma distinta en cada cepa en la expresión de monocitos**. 
+
+### Identificación de los grupos
+
+Se trata de una muestra de 20 animales divididos en 4 grupos cada uno de ellos con 5 réplicas por grupo. Para cada grupo se considera la combinación de dos factores con dos niveles cada uno de ellos: 
++ dieta (niveles: estándard y cafetería)
+
++ cepa de rata (niveles: LEW y WKY)
+
+```{r, include=TRUE, echo=FALSE}
+targets <- read.csv2(file.path(dataDir, params$target_file), header = TRUE, sep = ";") 
+kable(targets, caption = 'Identificación de los grupos para cada archivo CEL', digits = 5, row.names = FALSE)
+```
+
++ **Archivos CEL**
+
+```{r, include=TRUE, results='hide', echo=FALSE, message=FALSE, warning=FALSE}
+celFiles <- list.celfiles(dataDir, full.names = TRUE)
+my.targets <-read.AnnotatedDataFrame(file.path(dataDir,params$target_file), 
+                                     header = TRUE, row.names = 1, sep=";") 
+rawData <- read.celfiles(celFiles, phenoData = my.targets)
+my.targets@data$X.ShortName. -> rownames(pData(rawData))
+colnames(rawData) <- rownames(pData(rawData)) 
+```
+
+```{r, include=TRUE, echo=FALSE}
+head(rawData)
+#Dimensiones de los datos
+dim_genes <- dim(exprs(rawData))
+```
+
+
+Se trata del archivo de datos con código GSE85167 que tiene `r dim_genes[1]` genes y `r dim_genes[2]` muestras. 
+
+### Control de calidad de los datos crudos
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+arrayQualityMetrics(rawData, outdir = resultsDir)
+```
+
+```{r, fig.align="center", fig.cap="Detección de outliers de los datos sin procesar (extraído del archivo 'index.html' producido por el paquete 'arrayQualityMetrics')", echo=FALSE}
+include_graphics(file.path(figuresDir, "Figure_1.png"), dpi = 150)
+```
+
+Con el paquete `ArrayQualityMetrics` de Bioconductor analizamos la presencia de _outliers_ mediante diferentes aproximaciones (ver Figura 1). Como resultado obtenemos 3 muestras que superan el _threshold_ para los MA plots y una muestra que supera el _threshold_ de intensidad de los datos representado en el _boxplot_. Dado que estas muestras solamente presentan un asterisco, las mantedremos sin considerarlas un problema potencial. Sin embargo, la muestra `WKY.STD.5` debería ser revisada tras la normalización y probablemente eliminada para mejorar la calidad de los datos dado que presenta asterísco para las tres metodologías analizadas. 
+
+```{r, include= FALSE, echo=FALSE}
+plotPCA3 <- function (datos, labels, factor, title, scale,colores, size = 1.5, glineas = 0.25) {
+   #PCA
+   data <- prcomp(t(datos),scale=scale)
+   # plot adjustments
+   dataDf <- data.frame(data$x)
+   Group <- factor
+   loads <- round(data$sdev^2/sum(data$sdev^2)*100,1)
+   # main plot
+   p1 <- ggplot(dataDf,aes(x=PC1, y=PC2)) +
+     theme_classic() +
+     geom_hline(yintercept = 0, color = "gray70") +
+     geom_vline(xintercept = 0, color = "gray70") +
+     geom_point(aes(color = Group), alpha = 0.55, size = 3) +
+     coord_cartesian(xlim = c(min(data$x[,1])-5,max(data$x[,1])+5)) +
+     scale_fill_discrete(name = "Group")
+   # avoiding labels superposition
+   p1 + geom_text_repel(aes(y = PC2 + 0.25, label = labels),segment.size = 0.25, size = size) + 
+     labs(x = c(paste("PC1",loads[1],"%")),y=c(paste("PC2",loads[2],"%"))) +  
+     ggtitle(paste("Principal Component Analysis for: ",title,sep=" "))+ 
+     theme(plot.title = element_text(hjust = 0.5)) +
+     scale_color_manual(values=colores)
+   }
+```
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", fig.cap="Visualización de las dos primeras componentes principales del PCA para los datos sin procesar", echo=FALSE}
+plotPCA3(exprs(rawData), labels = targets$ShortName, factor = targets$Group, 
+         title="Raw data", scale = FALSE, size = 3, 
+         colores = c("red", "blue", "green", "yellow"))
+```
+
+En el gráfico de la Figura 2 se han representado las dos primeras componentes del PCA (Principal Component Analysis) que explicarían el 46% total de la variabilidad de las muestras. Observamos que las réplicas se encuentran agrupadas por grupos, con la excepción de `WKY.STD` entre las cuales recordemos se encuentra el potencial _outlier_, situado arriba-derecha de la gráfica. La variabilidad de la primera componente tiene una contribución muy alta de la cepa WKY, que como podemos observar se encuentran todas las muestras a la derecha de la gráfica, mientras que la cepa LEW la encontramos a la izquierda. Respecto a la contribución de la segunda componente, la contribución no está tan dividida, pero observamos que hay una tendencia a que las muestras de la dieta STD se encuentran con valores positivos más elevados que los correspondientes a la dieta CAF que tienden a encontrarse en el inferior de la gráfica. 
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", fig.cap="Diagrama de caja para intensidades de matrices de los datos sin procesar", echo=FALSE}
+boxplot(rawData, cex.axis=0.8, las=2,  which="all", 
+        col = c(rep("red", 5), rep("blue", 5), rep("green", 5), rep("yellow", 5)),
+        main="Distribution of intensity values: Raw data")
+```
+
+En el diagrama de cajas se representa la distribución de la intesidad de los arrays (ver Figura 3). Podemos observar que la media es bastante regular entre las réplicas y entre los grupos. Sin embargo, observamos una mayor variabilidad en el caso de las réplicas pertenecientes a `WKY.STD` entre los cuales se encuentra el potencial _outlier_.
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", fig.cap="Histograma de los arrays correspondientes a los datos crudos", echo=FALSE}
+hist(rawData, cex.axis=0.5, las=2, which="all",
+     col = c(rep("red", 5), rep("blue", 5), rep("green", 5), rep("yellow", 5)),
+     main="Distribution Signals")
+```
+
+Observamos que la señal de todos los arrays sigue una distribución muy parecida con los datos crudos, no hay aparentemente ninguna alteración o diferencia. 
+
+### Normalización
+
+Antes de inicar el análisis, realizamos la normalización de los datos para poder compararlos entre ellos y así reducir la variabilidad de las muestras no debidas a razones biológicas. Con la normalización, observaremos si reducimos el _outlier_ que nos marcaba el apartado anterior o bien si debemos eliminarlo. 
+
+```{r, include=TRUE, echo=FALSE}
+eset_rma <- rma(rawData)
+#Dimensiones de los datos tras la normalización
+dim_norm <- dim(exprs(eset_rma))
+```
+
+Tras la normalización del archivo de datos con código GSE85167, se observan `r dim_norm[1]` genes y `r dim_norm[2]` muestras. Vemos que se ha reducido bastante el número de genes.
+
+
+### Control de calidad de los datos normalizados
+
+```{r, include= FALSE, echo=FALSE, message=FALSE, warning=FALSE, eval=FALSE}
+arrayQualityMetrics(eset_rma, outdir = resultsDir, force = TRUE)
+```
+
+```{r, fig.align="center", fig.cap="Detección de outliers de los datos normalizados (extraído del archivo 'index.html' producido por el paquete 'arrayQualityMetrics')", echo=FALSE}
+include_graphics(file.path(figuresDir, "Figure_2.png"), dpi = 150)
+```
+
+Gracias a la normalización de los datos observamos que la muestra `WKY.STD.5` que era un potencial _outlier_ se ha corregido (ver Figura 4). Aún así, se mantienen un asterisco en dos muestras de este mismo grupo que como habíamos visto presentaba mayores variaciones. 
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", fig.cap="Visualización de las dos primeras componentes principales del PCA para los datos normalizados", echo=FALSE}
+plotPCA3(exprs(eset_rma), labels = targets$ShortName, factor = targets$Group, 
+         title="Normalized data", scale = FALSE, size = 3, 
+         colores = c("red", "blue", "green", "yellow"))
+```
+
+El diagrama de dispersión de las dos primeras componentes principales realizado usando esta vez los datos normalizados (ver Figura 5). Es importante destacar que ha aumentado ligeramente (_i.e._, 49.7%) la variabilidad explicada por ambas componentes respecto al PCA realizado con los datos crudos (ver Figura 2), aunque la proporción ha variado notablemente, siendo la PC1 la que contribuye en su mayor parte. De la misma forma que en la Figura 2, las muestras quedan separadas en la PC1 de acuerdo al factor cepa de rata, situando el nivel WKY a la derecha y LEW a la izquierda. Sin embargo, resulta difícil en esta ocasión establecer una distribución diferenciada de las muestras de acuerdo al factor de la dieta, lo que provoca que los grupos de dieta no se encuentren agrupados como en la Figura 2. 
+  
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", fig.cap="Diagrama de caja para intensidades de matrices de los datos normalizados", echo=FALSE}
+boxplot(eset_rma, cex.axis=0.8, las=2,  which="all", 
+        col = c(rep("red", 5), rep("blue", 5), rep("green", 5), rep("yellow", 5)),
+        main="Distribution of intensity values: Normalized data")
+```
+
+El diagrama de cajas (ver Figura 6) muestra la distribución de las intesidades normalizadas de las muestras. Nuevamente, dado que todas las cajas presentan un aspecto homogéneo, podemos determinar que la normalización ha permitido corregir las pequeñas variaciones que existían, especialmente en el grupo `WKY.STD`.
+
+### Filtraje no específico
+
+Con el fin de analizar pequeñas variaciones en la expresión génica por causas no biológicas (_i.e._, investigador-técnico, fecha del procesamiento, reactivos), realizamos un _Principal variation component analysis_ (PVCA). 
+
+```{r, include= FALSE, echo=TRUE, warning=FALSE}
+fechas <- get.celfile.dates(celFiles)
+```
+
+En primer lugar, comprobamos que todos los microarrays se realizaron en la misma fecha: `r unique(fechas)`
+
++ **_Principal variation component analysis_ (PVCA)**
+
+```{r, include= FALSE, echo=TRUE, warning=FALSE}
+pData(eset_rma) <- targets
+#select the threshold
+pct_threshold <- 0.6
+#select the factors to analyze
+batch.factors <- c("Cepa", "Dieta")
+#run the analysis
+pvcaObj <- pvcaBatchAssess(eset_rma, batch.factors, pct_threshold)
+```
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", echo=FALSE, fig.cap="Importancia relativa de los diferentes factores (Cepa, Dieta e interacción) que afectan la expresión génica"}
+bp <- barplot(pvcaObj$dat, xlab = "Effects",
+              ylab = "Weighted average proportion variance",
+              ylim= c(0,1.1), col = c("mediumorchid"), las=2,
+              main="PVCA estimation")
+axis(1, at = bp, labels = pvcaObj$label, cex.axis = 0.75, las=2)
+values = pvcaObj$dat
+new_values = round(values , 3)
+text(bp,pvcaObj$dat,labels = new_values, pos=3, cex = 0.7)
+```
+
+El histograma (ver Figura 7) muestra una barra por cada fuente de variación del análisis (_i.e._, cepa, dieta e interacción). Observamos que la principal fuente de variación es la condición de la cepa de rata que contribuye con un 56.6% a la variación de los datos causada por el factor lote, como se vio en las anteriores gráficas de PCA (ver Figuras 2 y 5). La dieta en cambio tiene una contribución mínima. 
+
+### Identificación de genes diferencialmente expresados
+
+```{r, fig.width = 10, fig.asp = .4, fig.align="center", echo=FALSE, fig.cap="Desviación estándard para todos los genes de todas las muestras ordenados de menor a mayor"}
+sds <- apply (exprs(eset_rma), 1, sd)
+sdsO<- sort(sds)
+plot(1:length(sdsO), sdsO, main="Distribution of variability for all genes",
+    sub="Vertical lines represent 90% and 95% percentiles",
+    xlab="Gene index (from least to most variable)", ylab="Standard deviation")
+abline(v=length(sds)*c(0.9,0.95), col="red")
+```
+
+Se considera un gen diferencialmente expresado si hay una cierta diferencia en la varianza entre los grupos de estudio. En el gráfico (ver Figura 8) se traza la variabilidad general de todos los genes, con el fin de tener una idea del porcentaje de genes que presentan variabilidad no atribuible a una variación aleatoria. Por ello, en este gráfico se representa la desviación estándard de todos los genes ordenada de forma ascendente. Los genes más variables son los que se encuentran con una desviación estándar superior al 90-95%, es decir, todos aquellos genes a la derecha de las líneas verticales rojas, en este caso, corresponde a algo menos de 5000 genes. 
+
+```{r, include= FALSE, echo=TRUE, results='hide', message=FALSE}
+library(pd.ragene.1.0.st.v1)
+library(ragene10sttranscriptcluster.db)
+annotation(eset_rma) <- "ragene10sttranscriptcluster.db"
+filtered <- nsFilter(eset_rma, 
+                     require.entrez = TRUE, remove.dupEntrez = TRUE,
+                     var.filter=TRUE, var.func=IQR, var.cutoff=0.75, 
+                     filterByQuantile=TRUE, feature.exclude = "^AFFX")
+```
+
+```{r, include=TRUE, echo=TRUE}
+print(filtered$filter.log)
+eset_filtered <-filtered$eset
+eset_filtered
+```
+
+En consecuencia, resulta importante filtrar aquellos genes cuya variabilidad en la expresión génica es atribuible a la aleatoriedad y no como resultado del diseño experimental. Para ello, descargamos la base de datos de anotaciones en función del tipo de microarray empleado. Por lo tanto, dado que se ha empleado el microarray _Affymetrix Rat Gene 1.0 ST Array_, se ha buscado en la web de [Bioconductor](ragene10sttranscriptcluster.db) la base de datos correspondiente, `ragene10sttranscriptcluster.db`, en este caso. A continuación, se han filtrado los genes con la función `nsFilter` y se han obtenido 4464 genes con potencial para ser diferencialmente expresados, eliminando aquellos que presentaban variaciones aleatorias.
+
+```{r, include= FALSE, echo=FALSE, results='hide', message=FALSE}
+# Exportación de los datos normalizados
+write.csv(exprs(eset_rma), file= file.path(resultsDir, "normalized.Data.csv"))
+write.csv(exprs(eset_filtered), file=file.path(resultsDir, "normalized.Filtered.Data.csv"))
+save(eset_rma, eset_filtered, file=file.path(resultsDir, "normalized.Data.Rda"))
+```
+
++ **Matriz de diseño**
+
+La matriz de diseño permite mostrar la asignación de cada muestra a un grupo experimental. En este caso tenemos una matriz de 20 filas, una por muestra, y 4 columnas, una por grupo. Cada fila contiene un 1 en la columna del grupo al que pertenece la muestra y un 0 en los demás.
+
+```{r, echo=FALSE}
+if (!exists("eset_filtered")) load (file= file.path(resultsDir, params$normalized_file))
+```
+
+```{r, include= TRUE, echo=FALSE, message=FALSE}
+designMat<- model.matrix(~0+Group, pData(eset_filtered))
+colnames(designMat) <- unique(targets$Group)
+print(designMat)
+```
+
++ **Matriz de contraste**
+
+En este estudio el objetivo principal es analizar el efecto de la dieta en la expresión génica por cada cepa de rata (_i.e._, WKY.CAF vs WKY.STD -- LEW.CAF vs LEW.STD), así como la interacción entre la dieta y la cepa. Por lo tanto, la matriz de contraste quedaría del siguiente modo:
+
+```{r, include= TRUE, echo=TRUE, message=FALSE, include= TRUE}
+cont.matrix <- makeContrasts (STDvsCAF.LEW = LEW.STD - LEW.CAF,
+                              STDvsCAF.WKY = WKY.STD - WKY.CAF,
+                              INT = (LEW.STD - LEW.CAF) - (WKY.STD - WKY.CAF),
+                              levels=designMat)
+print(cont.matrix)
+```
+
++ **Estimación del modelo y selección de genes diferenciados**
+
+Realizamos los tests de significancia con el paquete `limma` para seleccionar aquellos genes diferencialmente expresados, definidos en las anteriores comparaciones. Se realiza también el ajuste del p-valor con el método Benjamini and Hochberg con el fin de evitar la aparición de un alto número de falsos positivos debido al alto número de cálculos de contrastes simultáneos en los mismos datos.
+
+```{r, include= TRUE, echo=TRUE, message=FALSE, warning=FALSE}
+fit <- lmFit(eset_filtered, designMat)
+fit.main <- contrasts.fit(fit, cont.matrix)
+fit.main <- eBayes(fit.main)
+class(fit.main)
+```
+
+
+```{r,fig.width = 10, fig.asp = 1, fig.align="center", echo=FALSE, fig.cap="Gráfico volcán para las diferentes comparaciones considerando la cepa de rata y la dieta administrada"}
+geneSymbols <- select(ragene10sttranscriptcluster.db, rownames(fit.main), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+par(mfrow=c(2,2))
+volcanoplot(fit.main, coef=1, highlight=5, names=SYMBOLS, 
+            main=paste("Differentially expressed genes", colnames(cont.matrix)[1], sep="\n"))
+abline(v=c(-1,1),col="red")
+volcanoplot(fit.main, coef=2, highlight=5, names=SYMBOLS, 
+            main=paste("Differentially expressed genes", colnames(cont.matrix)[2], sep="\n"))
+abline(v=c(-1,1),col="red")
+volcanoplot(fit.main, coef=3, highlight=5, names=SYMBOLS, 
+            main=paste("Differentially expressed genes", colnames(cont.matrix)[3], sep="\n"))
+abline(v=c(-1,1),col="red")
+par(mfrow=c(1,1))
+```
+
+El volcano plot (ver Figura 9) permite visualizar de forma gráfica los genes que presentan expresión diferenciada para cada una de las comparaciones. En estos gráficos se muestra el fold-change, es decir, la escala logarítmica del efecto biológico y si éste es significativo en función del p-valor. Además, se destaca el nombre de los 5 genes más significativos para cada una de las comparaciones.
+
++ **Lista de genes diferencialmente expresados**
+
+Con la función `topTable` del paquete `limma` que permite obtener una lista ordenada según el p-valor del contraste ordenada de forma ascendente. 
+
+
+  a) LEW.STD vs LEW.CAF: analizar el efecto de la dieta en la expresión génica
+
+```{r, include=TRUE, echo=FALSE}
+topTab_STDvsCAF.LEW <- topTable (fit.main, number=nrow(fit.main), coef="STDvsCAF.LEW", adjust="fdr") 
+topTab_STDvsCAF.LEW <- topTab_STDvsCAF.LEW[order(topTab_STDvsCAF.LEW$adj.P.Val),]
+kable(head(topTab_STDvsCAF.LEW,2), caption = 'Genes que modifican su expresión en función de la dieta administrada entre la cepas de rata LEW (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+  b) WKY.STD vs WKY.CAF: analizar el efecto de la dieta en la expresión génica
+  
+```{r, include=TRUE, echo=FALSE}
+topTab_STDvsCAF.WKY <- topTable (fit.main, number=nrow(fit.main), coef="STDvsCAF.WKY", adjust="fdr") 
+topTab_STDvsCAF.WKY <- topTab_STDvsCAF.WKY[order(topTab_STDvsCAF.WKY$adj.P.Val),]
+kable(head(topTab_STDvsCAF.WKY, 2), caption = 'Genes que modifican su expresión en función de la dieta administrada entre la cepas de rata WKY (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+  c) INT: interacción entre la dieta administrada y la cepa de rata
+  
+```{r, include=TRUE, echo=FALSE}
+topTab_INT <- topTable (fit.main, number=nrow(fit.main), coef="INT", adjust="fdr") 
+topTab_INT <- topTab_INT[order(topTab_INT$adj.P.Val),]
+kable(head(topTab_INT, 2), caption = 'Genes que modifican su expresión en función de la dieta administrada y de la cepas de rata (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+### Anotación de los resultados
+
+Las tablas anteriores (Tablas 2, 3 y 4) muestran los genes que en el contraste de significancia presentan un p-value menor para cada una de las comparaciones establecidas. Es importante analizar si los p-valures ajustados son significativos. 
+
+La primera columna de estas tablas indica el código del gen de acuerdo con el distribuidor del microarray (Affimetrix en este caso). A partir de la base de datos de anotaciones correspondiente al microarray que se ha usado, podremos relacionar este código con identificadores estándars de los nombres de los genes correspondientes (_i.e._, Gene Symbol or Entrez gene identifier).
+
+```{r, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# Función para identificar los genes (Gene Annotation)
+annotatedTopTable <- function(topTab, anotPackage)
+{
+  topTab <- cbind(PROBEID=rownames(topTab), topTab)
+  myProbes <- rownames(topTab)
+  thePackage <- eval(parse(text = anotPackage))
+  geneAnots <- select(thePackage, myProbes, c("SYMBOL", "ENTREZID", "GENENAME"))
+  annotatedTopTab<- merge(x=geneAnots, y=topTab, by.x="PROBEID", by.y="PROBEID")
+  annotatedTopTab <- annotatedTopTab[order(annotatedTopTab$adj.P.Val),]
+return(annotatedTopTab)
+}
+```
+
+```{r, include=FALSE, echo=FALSE}
+topAnnotated_STDvsCAF.LEW <- annotatedTopTable(topTab_STDvsCAF.LEW, anotPackage="ragene10sttranscriptcluster.db")
+topAnnotated_STDvsCAF.WKY <- annotatedTopTable(topTab_STDvsCAF.WKY, anotPackage="ragene10sttranscriptcluster.db")
+topAnnotated_INT <- annotatedTopTable(topTab_INT, anotPackage="ragene10sttranscriptcluster.db")
+```
+
+Volvemos a mostrar las tablas anteriores, esta vez para los 10 primeros genes de cada comparación:
+
+ a) LEW.STD vs LEW.CAF: analizar el efecto de la dieta en la expresión génica
+
+```{r, include=TRUE, echo=FALSE}
+kable(head(topAnnotated_STDvsCAF.LEW,10), caption = 'Genes que modifican su expresión en función de la dieta administrada entre la cepas de rata LEW (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+  b) WKY.STD vs WKY.CAF: analizar el efecto de la dieta en la expresión génica
+  
+```{r, include=TRUE, echo=FALSE}
+kable(head(topAnnotated_STDvsCAF.WKY, 10), caption = 'Genes que modifican su expresión en función de la dieta administrada entre la cepas de rata WKY (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+  c) INT: interacción entre la dieta administrada y la cepa de rata
+  
+```{r, include=TRUE, echo=FALSE}
+kable(head(topAnnotated_INT, 10), caption = 'Genes que modifican su expresión en función de la dieta administrada y de la cepas de rata (tabla ordenada según el p-valor ajustado)', digits = 5, row.names = TRUE)
+```
+
+```{r, include=FALSE, echo=FALSE}
+# Exportación de los genes ordenados por p-valor en función del contraste de cada comparación y con la anotación correspondiente
+write.csv(topAnnotated_STDvsCAF.LEW, file= file.path(resultsDir, "topAnnotated_STDvsCAF.LEW.csv"))
+write.csv(topAnnotated_STDvsCAF.WKY, file= file.path(resultsDir, "topAnnotated_STDvsCAF.WKY.csv"))
+write.csv(topAnnotated_INT, file=file.path(resultsDir,"topAnnotated_INT.csv"))
+```
+
+### Comparación entre comparaciones
+
+
+```{r,include=TRUE, echo=FALSE}
+res <- decideTests(fit.main, method="separate", adjust.method="fdr", p.value=0.1, lfc=1)
+sum.res.rows <- apply(abs(res),1,sum)
+res.selected <- res[sum.res.rows!=0,] 
+print(summary(res))
+```
+
+En la tabla se representan en las columnas el nº de comparaciones. Las filas hacen referencia a la expresión genética, siendo up-regulated, down-regulated o sin diferencia significativa estableciendo un cutoff de 0.1 del p-value y un log2-fold-change mínimo de 1. Aplicando este filtro obtenemos un conjunto de genes up-regulated bastante alto en los grupos CAFvsSTD para ambas cepas de rata, mientras que genes down-regulated se encuentran la mitad o la tercera parte de los anteriores. Sin embargo, sorprenden los datos del grupo WKYvsLEW.CAF en los que no tenemos ningún gen significativo debido a los valores altos de p-valor. 
+
++ **Diagrama de Venn**
+
+```{r, fig.width = 10, fig.asp = 1, fig.align="center", echo=FALSE, fig.cap="Genes en común entre las 3 comparaciones realizadas previamente (Selección FDR < 0.1 and logFC > 1)"}
+vennDiagram (res.selected[,1:3], cex=0.9)
+```
+
+En el diagrama de Venn (ver Figura 10) representamos aquellos genes que se encuentran en común entre las 3 comparaciones anteriores. En este caso, vemos que en la comparación de la dieta CAFvsSTD para cada una de las cepas, comparten 140 genes up o down-regulated. Evidentemente, como hemos comentado, no aparece ningún gen para el grupo WKYvsLEW.CAF. 
+
++ **Heatmap**
+
+```{r, echo=FALSE, include=TRUE, message=FALSE, warning=FALSE}
+probesInHeatmap <- rownames(res.selected)
+HMdata <- exprs(eset_filtered)[rownames(exprs(eset_filtered)) %in% probesInHeatmap,]
+geneSymbols <- select(ragene10sttranscriptcluster.db, rownames(HMdata), c("SYMBOL"))
+SYMBOLS<- geneSymbols$SYMBOL
+rownames(HMdata) <- SYMBOLS
+write.csv(HMdata, file = file.path(resultsDir, "data4Heatmap.csv"))
+```
+
+```{r, fig.width = 10, fig.asp = 1, fig.align="center", echo=FALSE, fig.cap="Heatmap de la expresión de genes agrupados por su similitud"}
+my_palette <- colorRampPalette(c("blue", "red"))(n = 299)
+heatmap(HMdata,
+         Rowv = TRUE,
+         Colv = TRUE,
+         dendrogram = "both",
+         main = "Differentially expressed genes \n FDR < 0,1, logFC >=1",
+         scale = "row",
+         col = my_palette,
+         sepcolor = "white",
+         sepwidth = c(0.05,0.05),
+         cexRow = 0.5,
+         cexCol = 0.9,
+         key = TRUE,
+         keysize = 1.5,
+         density.info = "histogram",
+         ColSideColors = c(rep("red",5),rep("blue",5), rep("green",5), rep("yellow",5)),
+         tracecol = NULL,
+         srtCol = 30)
+```
+
+En el heatmap (ver Figura 11) observamos los genes expresados significativamente destacados en una gradación de color (azul a rojo para down-regulated y up-regulated, respectivamente). Los genes seleccionados según el criterio anterior (_i.e._, FDR < 0.1 and logFC > 1) se encuentran ordenados de acuerdo a su similitud.
+
+### Análisis de significación biológica
+
+Once a list of gene has being obtained that characterizes the difference between two conditions it has to be interpreted. Although this requires, of course, a good understanding of the underlying biological problem, a statistical approach known as “Gene Set Analysis” can be useful for suggesting ideas for the interpretation. With this aim these types of analyses seek to establish whether, given a list of genes selected for being
+differential expressed between two conditions, the functions, biological processes or molecular pathways that characterize them appear on this list more frequently than among the rest of the genes analyzed.
+There are many variants of these types of analysis, see Khatri, Sirota, and Butte (2012), but here we will use the basic enrichment analysis as described in implemented in the ReactomePA Bioconductor package. The
+analysis is done on the ReactomePA annotation database https://reactome.org/.
+Analyses of this type need a minimum number of genes to be reliable, preferably a few hundreds than a few
+dozens, so it is common to perform a selection less restrictive than with the previous steps. For instance
+an option is to include all genes with a non-stringent FDR cutoff, such as FDR < 0.15 without filtering by
+minimum “fold-change”).
+As a first step we prepare the list of gene lists that will be analyzed:
+
+```{r pagebreak, echo=FALSE, results='asis', eval=is_latex_output()}
+cat('\\pagebreak')
+```
+
+## INFORME DEL ANÁLISIS
+
+**Identificación de la expresión transcripcional en monocitos mediante el uso de modelos de ratas endogámicas en una dieta de cafetería**
+
+### Abstract
+### Introducción y Objetivo
+
+La obesidad representa un importante problema de salud con una alta tasa de crecimiento en nuestra sociedad. Por esta razón, es necesario disponer de modelos animales que reproduzcan de forma óptima las principales características de la obesidad humana (*i.e*., aumento de peso, adipogénesis and dislipidemia).  Con este fin, en el presente estudio se emplean dos cepas de ratas que presentan dos perfiles genéticos que determinan una respuesta fenotípica y metabólica diferente tras la inducción producida por una dieta obesogénica. De modo que en el caso de las ratas Lewis (LEW) metabolizan preferentemente carbohidratos, mientras que las ratas Wistar Kyoto (WKY) metabolizan los lípidos y además, se observan variaciones en la regulación de la leptina @PMID-26450996. La dieta de cafetería (CAF) administrada a las ratas es considerada un buen modelo para provocar el síndrome metabólico y las patalogías relacionadas, entre las que se encuentran la obesidad. La dieta de cafetería consiste en la ingesta voluntaria de productos muy calóricos y energéticos.
+
+Los monocitos son células immunitarias de particular interés dado que son circulantes se encuentran expuestas a factores metabólicos y la produccion de citoquinas pro-inflamatorias. En consecuencia, la regulación del perfil de expresión génica de monocitos podría reflejar el estado fisiológico de todo el organismo.
+
+Por lo tanto, el análisis con microarrays en este estudio originalmente presenta dos objetivos: 
+  1) comparar los perfiles de expresión de monocitos entre las ratas WKY y LEW para identificar genes expresados por la adaptación genotípica inducida por la obesidad (dieta de cafetería).
+
+  2) analizar el efecto de la dieta (STD vs cafetería) en la expresión genética de cada tipo de rata.
+  
+Sin embargo, en nuestro estudio nos hemos centrado en el análisis del segundo objetivo. 
+
+### Materiales y Métodos
+
++ Diseño experimental 
+
+Tras un período de adaptación cada cepa de rata fue distribuida de forma aleatoria a uno de los dos grupos de dieta administrada durante 7 semanas. La unidad observacional corresponde a los monocitos circulantes aislados de la extracción de sangre procedente de la aorta abdominal.
+
++ Diseño computacional
+
+The microarray analysis presented in this chapter has been performed with the latest version of R which, at the moment of writing, was 3.4.4. 
+The dataset selected is identified with the accession number: GSE100924. That is, it was a 2×2 factorial design (genotype and temperature) with two levels each (wild type and knock out, for genotype, and room temperature and cold, for temperature). The sample size of the experiment is 12 samples, three replicates of each group.
+The microarrays used for this experiment were of type Mouse Gene 2.1 from Affymetrix, now Thermofisher, one of the most popular vendors of microarray technology.
+
+### Resultados y Discusión
+### Conclusión
+
+### References
+
+
